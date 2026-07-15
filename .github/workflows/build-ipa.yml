@@ -1,9 +1,16 @@
+# vivi_music_ios build-ipa.yml
+# rev: 6 (bump iOS deployment target to 15.0 across Podfile / Runner.xcodeproj / AppFrameworkInfo.plist)
 name: Build iOS IPA
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+
+env:
+  # Flutter 3.44 が最低 iOS 13.0 を要求。macos-latest ランナーの Xcode は
+  # 更に高い最小 15.0 を強制するため、全体を 15.0 に統一する。
+  IOS_TARGET: "15.0"
 
 jobs:
   build:
@@ -21,62 +28,174 @@ jobs:
 
       - name: Complete Flutter project (generate ios/ scaffold)
         # プロジェクト名は pubspec.yaml と一致させる必要がある。
-        # 組織 (--org) はバンドルID の前半になる (com.vivi.viviMusic)。
+        # 組織 (--org) はバンドル ID の前半になる (com.vivi.viviMusic)。
         run: flutter create --platforms=ios --project-name vivi_music --org com.vivi .
 
       - name: Patch Info.plist (background audio + display name + ATS)
         run: |
           PLIST=ios/Runner/Info.plist
-          # バックグラウンド再生を許可
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST"
-
-          # 表示名を VIVI Music に固定
           /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 'VIVI Music'" "$PLIST" 2>/dev/null || \
             /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 'VIVI Music'" "$PLIST"
-
-          # YouTube ストリーム URL や LRCLib へ通信するため任意ドメインの HTTP を許可
-          # (実際のトラフィックはほぼ HTTPS だが、まれに googlevideo.com からのリダイレクトで
-          #  一時的に http:// が返ることがあるためフォールバックを緩めておく)
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" "$PLIST"
+
+      - name: Bump iOS deployment target to ${{ env.IOS_TARGET }}
+        # Flutter 3.44 は デフォルト iOS 13.0 で生成するが、それだと
+        # Flutter Pod / Xcode 27 のどちらとも競合するため、Runner.xcodeproj と
+        # AppFrameworkInfo.plist の最低 iOS を IOS_TARGET に揃える。
+        run: |
+          T="${{ env.IOS_TARGET }}"
+
+          # Runner.xcodeproj の全 configuration の IPHONEOS_DEPLOYMENT_TARGET を書き換え
+          PBXPROJ=ios/Runner.xcodeproj/project.pbxproj
+          sed -i '' -E "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/IPHONEOS_DEPLOYMENT_TARGET = ${T};/g" "$PBXPROJ"
+          echo "=== IPHONEOS_DEPLOYMENT_TARGET lines after patch ==="
+          grep IPHONEOS_DEPLOYMENT_TARGET "$PBXPROJ" | head -10 || true
+
+          # AppFrameworkInfo.plist の MinimumOSVersion を書き換え
+          AFPI=ios/Flutter/AppFrameworkInfo.plist
+          if [ -f "$AFPI" ]; then
+            /usr/libexec/PlistBuddy -c "Set :MinimumOSVersion ${T}" "$AFPI" 2>/dev/null || \
+              /usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string ${T}" "$AFPI"
+            echo "=== AppFrameworkInfo.plist MinimumOSVersion ==="
+            /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$AFPI"
+          fi
 
       - name: Flutter pub get
         run: flutter pub get
 
-      - name: Pod install (audio_service / just_audio 用の Pods を確定)
+      - name: Flutter build iOS (config-only, generates Generated.xcconfig)
+        # --config-only は Generated.xcconfig だけ作る (Podfile は作らない)
+        run: flutter build ios --config-only --release --no-codesign
+
+      - name: Verify Generated.xcconfig exists
+        run: |
+          XCCONFIG=ios/Flutter/Generated.xcconfig
+          if [ ! -f "$XCCONFIG" ]; then
+            echo "::error::$XCCONFIG が生成されませんでした"
+            exit 1
+          fi
+          echo "=== Generated.xcconfig ==="
+          cat "$XCCONFIG"
+
+      - name: Write Podfile from Flutter standard template
+        # Flutter に頼らず、確定的にテンプレートから書き出す。
+        # platform を IOS_TARGET に固定し、post_install で全 Pod ターゲットの
+        # IPHONEOS_DEPLOYMENT_TARGET を IOS_TARGET に強制する。
+        run: |
+          T="${{ env.IOS_TARGET }}"
+
+          # ヒアドキュメントは 'PODFILE' クォートで囲むので中身は変数展開されない。
+          # プレースホルダ __IOS_TARGET__ を後段の sed で置換する。
+          cat > ios/Podfile <<'PODFILE'
+          platform :ios, '__IOS_TARGET__'
+
+          ENV['COCOAPODS_DISABLE_STATS'] = 'true'
+
+          project 'Runner', {
+            'Debug' => :debug,
+            'Profile' => :release,
+            'Release' => :release,
+          }
+
+          def flutter_root
+            generated_xcode_build_settings_path = File.expand_path(File.join('..', 'Flutter', 'Generated.xcconfig'), __FILE__)
+            unless File.exist?(generated_xcode_build_settings_path)
+              raise "#{generated_xcode_build_settings_path} must exist. If you're running pod install manually, make sure flutter pub get is executed first"
+            end
+            File.foreach(generated_xcode_build_settings_path) do |line|
+              matches = line.match(/FLUTTER_ROOT\=(.*)/)
+              return matches[1].strip if matches
+            end
+            raise "FLUTTER_ROOT not found in #{generated_xcode_build_settings_path}. Try deleting Generated.xcconfig, then run flutter pub get"
+          end
+
+          require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
+
+          flutter_ios_podfile_setup
+
+          target 'Runner' do
+            use_frameworks!
+            flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
+          end
+
+          post_install do |installer|
+            installer.pods_project.targets.each do |target|
+              flutter_additional_ios_build_settings(target)
+              target.build_configurations.each do |config|
+                config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '__IOS_TARGET__'
+              end
+            end
+          end
+          PODFILE
+
+          # プレースホルダを実値に置換
+          sed -i '' "s/__IOS_TARGET__/${T}/g" ios/Podfile
+          echo "=== Podfile head ==="
+          head -25 ios/Podfile
+
+      - name: Pod install
         run: |
           cd ios
           pod install --repo-update
           cd ..
+          echo "=== Post pod install ==="
+          echo "Podfile.lock:       $([ -f ios/Podfile.lock ] && echo YES || echo NO)"
+          echo "Pods/:              $([ -d ios/Pods ] && echo YES || echo NO)"
+          echo "Runner.xcworkspace: $([ -d ios/Runner.xcworkspace ] && echo YES || echo NO)"
 
-      - name: Flutter build iOS (no codesign)
-        # Runner.xcodeproj の署名パッチは削除。--no-codesign だけで
-        # 十分 (Flutter 内部で xcodebuild に CODE_SIGNING_ALLOWED=NO を渡す)。
-        # Flutter の最終署名チェックで警告になっても、その時点で
-        # xcodebuild は完了しているので Runner.app は正しく生成される。
+      - name: Patch Runner.xcodeproj (disable code signing)
+        # xcodebuild にコマンドライン引数で渡すだけでも通常は十分だが、
+        # 一部のフェーズで pbxproj の値が直接参照されるケースがあるため、
+        # プロジェクト側でも署名要件を完全に外しておく (保険)。
+        run: |
+          PBXPROJ=ios/Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' "$PBXPROJ"
+          sed -i '' 's/CODE_SIGN_IDENTITY = "Apple Development";/CODE_SIGN_IDENTITY = "";/g' "$PBXPROJ"
+          sed -i '' 's/"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = "Apple Development";/"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "";/g' "$PBXPROJ"
+          sed -i '' 's/DEVELOPMENT_TEAM = [A-Z0-9]*;/DEVELOPMENT_TEAM = "";/g' "$PBXPROJ"
+          echo "=== Signing-related lines after patch ==="
+          grep -E "CODE_SIGN|DEVELOPMENT_TEAM|PROVISIONING_PROFILE" "$PBXPROJ" | head -20 || true
+
+      - name: Build with xcodebuild (no signing)
         continue-on-error: true
-        id: flutter_build
+        id: xbuild
         run: |
           set -o pipefail
-          flutter build ios --release --no-codesign 2>&1 | tee /tmp/flutter_build.log
+          xcodebuild \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/ios/xc \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            build \
+            2>&1 | tee /tmp/xcodebuild.log
 
-      - name: Show build log tail
+      - name: Show xcodebuild log tail
         if: always()
         run: |
-          echo "=== Last 100 lines of flutter build log ==="
-          tail -100 /tmp/flutter_build.log || true
+          echo "=== Last 200 lines of xcodebuild log ==="
+          tail -200 /tmp/xcodebuild.log 2>/dev/null || echo "no xcodebuild log"
 
       - name: Locate and verify Runner.app
         id: locate
         run: |
           echo "=== Runner.app candidates ==="
-          find build -name "Runner.app" -type d 2>/dev/null || true
+          find build ios -name "Runner.app" -type d 2>/dev/null || true
           echo ""
 
-          # 優先順に Runner.app を探す
           APP=""
           for candidate in \
+            "build/ios/xc/Build/Products/Release-iphoneos/Runner.app" \
             "build/ios/iphoneos/Runner.app" \
             "build/ios/Release-iphoneos/Runner.app"; do
             if [ -d "$candidate" ]; then
@@ -84,9 +203,8 @@ jobs:
               break
             fi
           done
-          # フォールバック: find で最初に見つかったもの
           if [ -z "$APP" ]; then
-            APP=$(find build -name "Runner.app" -type d 2>/dev/null | head -1)
+            APP=$(find build ios -name "Runner.app" -type d 2>/dev/null | head -1)
           fi
 
           if [ -z "$APP" ] || [ ! -d "$APP" ]; then
@@ -96,26 +214,19 @@ jobs:
 
           echo "=== Using: $APP ==="
           echo "Total size: $(du -sh "$APP" | cut -f1)"
-          echo ""
           echo "=== Contents (top level) ==="
           ls -la "$APP"
-          echo ""
 
-          # Runner バイナリの存在確認
           if [ ! -f "$APP/Runner" ]; then
             echo "::error::Runner バイナリが見つかりません ($APP/Runner)"
-            echo "ビルドが Compile Sources / Link Binary フェーズを完了していません。"
             exit 1
           fi
           echo "=== Runner binary ==="
           file "$APP/Runner"
           ls -lh "$APP/Runner"
-          echo ""
 
-          # Frameworks フォルダの存在確認
           if [ ! -d "$APP/Frameworks" ]; then
             echo "::error::Frameworks/ が見つかりません ($APP/Frameworks)"
-            echo "Embed Frameworks フェーズが完了していません。"
             exit 1
           fi
           echo "=== Frameworks ==="
@@ -123,7 +234,7 @@ jobs:
 
           echo "app_path=$APP" >> "$GITHUB_OUTPUT"
 
-      - name: Package IPA (dummy folder trick)
+      - name: Package IPA
         run: |
           mkdir -p dummy Payload
           cp -R "${{ steps.locate.outputs.app_path }}" Payload/
@@ -140,9 +251,143 @@ jobs:
           name: vivi-music-ipa
           path: dummy/
 
-      - name: Upload build log (on failure)
+      - name: Upload xcodebuild log (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: flutter-build-log
-          path: /tmp/flutter_build.log
+          name: build-logs
+          path: /tmp/xcodebuild.log
+          if-no-files-found: ignore
+          post_install do |installer|
+            installer.pods_project.targets.each do |target|
+              flutter_additional_ios_build_settings(target)
+            end
+          end
+          PODFILE
+          echo "=== Podfile head ==="
+          head -20 ios/Podfile
+
+      - name: Pod install
+        run: |
+          cd ios
+          pod install --repo-update
+          cd ..
+          echo "=== Post pod install ==="
+          echo "Podfile.lock: $([ -f ios/Podfile.lock ] && echo YES || echo NO)"
+          echo "Pods/:        $([ -d ios/Pods ] && echo YES || echo NO)"
+          echo "Runner.xcworkspace: $([ -d ios/Runner.xcworkspace ] && echo YES || echo NO)"
+
+      - name: Patch Runner.xcodeproj (disable code signing)
+        # xcodebuild にコマンドライン引数で渡すだけでも通常は十分だが、
+        # 一部のフェーズで pbxproj の値が直接参照されるケースがあるため、
+        # プロジェクト側でも署名要件を完全に外しておく (保険)。
+        run: |
+          PBXPROJ=ios/Runner.xcodeproj/project.pbxproj
+          sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' "$PBXPROJ"
+          sed -i '' 's/CODE_SIGN_IDENTITY = "Apple Development";/CODE_SIGN_IDENTITY = "";/g' "$PBXPROJ"
+          sed -i '' 's/"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = "Apple Development";/"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "";/g' "$PBXPROJ"
+          sed -i '' 's/DEVELOPMENT_TEAM = [A-Z0-9]*;/DEVELOPMENT_TEAM = "";/g' "$PBXPROJ"
+          echo "=== Signing-related lines after patch ==="
+          grep -E "CODE_SIGN|DEVELOPMENT_TEAM|PROVISIONING_PROFILE" "$PBXPROJ" | head -20 || true
+
+      - name: Build with xcodebuild (no signing)
+        continue-on-error: true
+        id: xbuild
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/ios/xc \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            build \
+            2>&1 | tee /tmp/xcodebuild.log
+
+      - name: Show xcodebuild log tail
+        if: always()
+        run: |
+          echo "=== Last 200 lines of xcodebuild log ==="
+          tail -200 /tmp/xcodebuild.log 2>/dev/null || echo "no xcodebuild log"
+
+      - name: Locate and verify Runner.app
+        id: locate
+        run: |
+          echo "=== Runner.app candidates ==="
+          find build ios -name "Runner.app" -type d 2>/dev/null || true
+          echo ""
+
+          APP=""
+          for candidate in \
+            "build/ios/xc/Build/Products/Release-iphoneos/Runner.app" \
+            "build/ios/iphoneos/Runner.app" \
+            "build/ios/Release-iphoneos/Runner.app"; do
+            if [ -d "$candidate" ]; then
+              APP="$candidate"
+              break
+            fi
+          done
+          if [ -z "$APP" ]; then
+            APP=$(find build ios -name "Runner.app" -type d 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+            echo "::error::Runner.app が見つかりません"
+            exit 1
+          fi
+
+          echo "=== Using: $APP ==="
+          echo "Total size: $(du -sh "$APP" | cut -f1)"
+          echo "=== Contents (top level) ==="
+          ls -la "$APP"
+
+          if [ ! -f "$APP/Runner" ]; then
+            echo "::error::Runner バイナリが見つかりません ($APP/Runner)"
+            exit 1
+          fi
+          echo "=== Runner binary ==="
+          file "$APP/Runner"
+          ls -lh "$APP/Runner"
+
+          if [ ! -d "$APP/Frameworks" ]; then
+            echo "::error::Frameworks/ が見つかりません ($APP/Frameworks)"
+            exit 1
+          fi
+          echo "=== Frameworks ==="
+          ls -la "$APP/Frameworks/"
+
+          echo "app_path=$APP" >> "$GITHUB_OUTPUT"
+
+      - name: Package IPA
+        run: |
+          mkdir -p dummy Payload
+          cp -R "${{ steps.locate.outputs.app_path }}" Payload/
+          zip -r dummy/vivi_music.ipa Payload
+          rm -rf Payload
+          echo "=== IPA info ==="
+          ls -lh dummy/vivi_music.ipa
+          echo "Uncompressed size:"
+          unzip -l dummy/vivi_music.ipa | tail -1
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: vivi-music-ipa
+          path: dummy/
+
+      - name: Upload xcodebuild log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: /tmp/xcodebuild.log
+          if-no-files-found: ignore
+
+
