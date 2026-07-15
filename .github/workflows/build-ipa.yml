@@ -1,5 +1,5 @@
 # vivi_music_ios build-ipa.yml
-# rev: 6 (bump iOS deployment target to 15.0 across Podfile / Runner.xcodeproj / AppFrameworkInfo.plist)
+# rev: 7 (link Pods xcconfigs into Flutter xcconfigs so PODS_PODFILE_DIR_PATH resolves at build time)
 name: Build iOS IPA
 
 on:
@@ -146,6 +146,46 @@ jobs:
           echo "Pods/:              $([ -d ios/Pods ] && echo YES || echo NO)"
           echo "Runner.xcworkspace: $([ -d ios/Runner.xcworkspace ] && echo YES || echo NO)"
 
+      - name: Link Pods xcconfigs into Flutter xcconfigs
+        # ---------------------------------------------------------------
+        # 前回の失敗原因の整理:
+        #   flutter create が生成する ios/Flutter/{Debug,Release,Profile}.xcconfig は
+        #   Generated.xcconfig しか include していない。Runner.xcodeproj の
+        #   baseConfigurationReference はこれらの Flutter xcconfig を指しているため、
+        #   CocoaPods は「既にカスタム xcconfig が設定済み」と見て自分の
+        #   xcconfig を紐付けない。結果として PODS_PODFILE_DIR_PATH 等が未定義になり、
+        #   [CP] Check Pods Manifest.lock で diff /Podfile.lock: No such file or directory
+        #   になる。
+        #
+        # 対策:
+        #   Flutter の各 xcconfig 冒頭に対応する Pods-Runner の xcconfig の
+        #   `#include?` を追加する。これは Flutter 側の標準ワークフローで
+        #   `flutter build ios` 実行時に自動追加される行と等価。
+        # ---------------------------------------------------------------
+        run: |
+          for cfg in Debug Release Profile; do
+            lc=$(echo "$cfg" | tr '[:upper:]' '[:lower:]')
+            FXC="ios/Flutter/${cfg}.xcconfig"
+            POD_INC='#include? "Pods/Target Support Files/Pods-Runner/Pods-Runner.'"${lc}"'.xcconfig"'
+
+            if [ ! -f "$FXC" ]; then
+              echo "WARN: $FXC が存在しない、スキップ"
+              continue
+            fi
+
+            if grep -qF "Pods-Runner.${lc}.xcconfig" "$FXC"; then
+              echo "$FXC : Pods include は既に存在"
+            else
+              # 先頭に include 行を挿入
+              { echo "$POD_INC"; cat "$FXC"; } > "${FXC}.new"
+              mv "${FXC}.new" "$FXC"
+              echo "$FXC : Pods include を追加"
+            fi
+
+            echo "--- $FXC ---"
+            cat "$FXC"
+          done
+
       - name: Patch Runner.xcodeproj (disable code signing)
         # xcodebuild にコマンドライン引数で渡すだけでも通常は十分だが、
         # 一部のフェーズで pbxproj の値が直接参照されるケースがあるため、
@@ -258,4 +298,3 @@ jobs:
           name: build-logs
           path: /tmp/xcodebuild.log
           if-no-files-found: ignore
-
