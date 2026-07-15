@@ -27,7 +27,7 @@ class ViviTheme {
           color: scheme.onSurface,
         ),
       ),
-      cardTheme: CardTheme(
+      cardTheme: CardThemeData(
         color: scheme.surfaceContainer,
         elevation: 0,
         shape: RoundedRectangleBorder(
