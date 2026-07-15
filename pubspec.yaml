@@ -1,0 +1,51 @@
+name: vivi_music
+description: VIVI Music iOS - YouTube Music player with synced lyrics and background playback.
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.6
+
+  # Audio playback + background service
+  just_audio: ^0.9.42
+  audio_service: ^0.18.15
+  audio_session: ^0.1.21
+
+  # YouTube / YouTube Music access (Dart InnerTube client)
+  youtube_explode_dart: ^2.3.2
+
+  # Networking
+  http: ^1.2.2
+  dio: ^5.7.0
+
+  # State management
+  provider: ^6.1.2
+  rxdart: ^0.28.0
+
+  # Storage
+  shared_preferences: ^2.3.2
+  path_provider: ^2.1.4
+
+  # UI
+  cached_network_image: ^3.4.1
+  palette_generator: ^0.3.3+4
+  google_fonts: ^6.2.1
+
+  # Utility
+  intl: ^0.19.0
+  collection: ^1.18.0
+  uuid: ^4.5.1
+
+dev_dependencies:
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/

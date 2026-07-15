@@ -1,0 +1,148 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Complete Flutter project (generate ios/ scaffold)
+        # プロジェクト名は pubspec.yaml と一致させる必要がある。
+        # 組織 (--org) はバンドルID の前半になる (com.vivi.viviMusic)。
+        run: flutter create --platforms=ios --project-name vivi_music --org com.vivi .
+
+      - name: Patch Info.plist (background audio + display name + ATS)
+        run: |
+          PLIST=ios/Runner/Info.plist
+          # バックグラウンド再生を許可
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST"
+
+          # 表示名を VIVI Music に固定
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 'VIVI Music'" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 'VIVI Music'" "$PLIST"
+
+          # YouTube ストリーム URL や LRCLib へ通信するため任意ドメインの HTTP を許可
+          # (実際のトラフィックはほぼ HTTPS だが、まれに googlevideo.com からのリダイレクトで
+          #  一時的に http:// が返ることがあるためフォールバックを緩めておく)
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" "$PLIST"
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Pod install (audio_service / just_audio 用の Pods を確定)
+        run: |
+          cd ios
+          pod install --repo-update
+          cd ..
+
+      - name: Flutter build iOS (no codesign)
+        # Runner.xcodeproj の署名パッチは削除。--no-codesign だけで
+        # 十分 (Flutter 内部で xcodebuild に CODE_SIGNING_ALLOWED=NO を渡す)。
+        # Flutter の最終署名チェックで警告になっても、その時点で
+        # xcodebuild は完了しているので Runner.app は正しく生成される。
+        continue-on-error: true
+        id: flutter_build
+        run: |
+          set -o pipefail
+          flutter build ios --release --no-codesign 2>&1 | tee /tmp/flutter_build.log
+
+      - name: Show build log tail
+        if: always()
+        run: |
+          echo "=== Last 100 lines of flutter build log ==="
+          tail -100 /tmp/flutter_build.log || true
+
+      - name: Locate and verify Runner.app
+        id: locate
+        run: |
+          echo "=== Runner.app candidates ==="
+          find build -name "Runner.app" -type d 2>/dev/null || true
+          echo ""
+
+          # 優先順に Runner.app を探す
+          APP=""
+          for candidate in \
+            "build/ios/iphoneos/Runner.app" \
+            "build/ios/Release-iphoneos/Runner.app"; do
+            if [ -d "$candidate" ]; then
+              APP="$candidate"
+              break
+            fi
+          done
+          # フォールバック: find で最初に見つかったもの
+          if [ -z "$APP" ]; then
+            APP=$(find build -name "Runner.app" -type d 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+            echo "::error::Runner.app が見つかりません"
+            exit 1
+          fi
+
+          echo "=== Using: $APP ==="
+          echo "Total size: $(du -sh "$APP" | cut -f1)"
+          echo ""
+          echo "=== Contents (top level) ==="
+          ls -la "$APP"
+          echo ""
+
+          # Runner バイナリの存在確認
+          if [ ! -f "$APP/Runner" ]; then
+            echo "::error::Runner バイナリが見つかりません ($APP/Runner)"
+            echo "ビルドが Compile Sources / Link Binary フェーズを完了していません。"
+            exit 1
+          fi
+          echo "=== Runner binary ==="
+          file "$APP/Runner"
+          ls -lh "$APP/Runner"
+          echo ""
+
+          # Frameworks フォルダの存在確認
+          if [ ! -d "$APP/Frameworks" ]; then
+            echo "::error::Frameworks/ が見つかりません ($APP/Frameworks)"
+            echo "Embed Frameworks フェーズが完了していません。"
+            exit 1
+          fi
+          echo "=== Frameworks ==="
+          ls -la "$APP/Frameworks/"
+
+          echo "app_path=$APP" >> "$GITHUB_OUTPUT"
+
+      - name: Package IPA (dummy folder trick)
+        run: |
+          mkdir -p dummy Payload
+          cp -R "${{ steps.locate.outputs.app_path }}" Payload/
+          zip -r dummy/vivi_music.ipa Payload
+          rm -rf Payload
+          echo "=== IPA info ==="
+          ls -lh dummy/vivi_music.ipa
+          echo "Uncompressed size:"
+          unzip -l dummy/vivi_music.ipa | tail -1
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: vivi-music-ipa
+          path: dummy/
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-build-log
+          path: /tmp/flutter_build.log
