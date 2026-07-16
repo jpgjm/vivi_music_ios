@@ -6,6 +6,20 @@ import '../models.dart';
 class YoutubeService {
   final YoutubeExplode _yt = YoutubeExplode();
 
+  /// Clients used for stream extraction.
+  ///
+  /// - `ios` returns **unciphered** stream URLs directly from the InnerTube
+  ///   `/player` endpoint. No `player.js` download / signature decipher
+  ///   step is required, which is dramatically faster (100–300 ms vs
+  ///   several seconds) and far more reliable than the default web client
+  ///   (whose URLs are also often throttled by YouTube).
+  /// - `androidVr` is a fallback for the rare videos the iOS client cannot
+  ///   resolve.
+  static const _streamClients = <YoutubeApiClient>[
+    YoutubeApiClient.ios,
+    YoutubeApiClient.androidVr,
+  ];
+
   Future<void> dispose() async {
     _yt.close();
   }
@@ -36,7 +50,10 @@ class YoutubeService {
 
   /// Resolve the best audio-only stream URL for a given [videoId].
   Future<String> getAudioStreamUrl(String videoId) async {
-    final manifest = await _yt.videos.streamsClient.getManifest(videoId);
+    final manifest = await _yt.videos.streamsClient.getManifest(
+      videoId,
+      ytClients: _streamClients,
+    );
     // Prefer highest-bitrate audio-only stream. Fall back to any audio.
     final audioOnly = manifest.audioOnly.sortByBitrate();
     if (audioOnly.isNotEmpty) {
