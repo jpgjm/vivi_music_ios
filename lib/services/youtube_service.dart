@@ -15,7 +15,7 @@ class YoutubeService {
   ///   (whose URLs are also often throttled by YouTube).
   /// - `androidVr` is a fallback for the rare videos the iOS client cannot
   ///   resolve.
-  static const _streamClients = <YoutubeApiClient>[
+  static final _streamClients = <YoutubeApiClient>[
     YoutubeApiClient.ios,
     YoutubeApiClient.androidVr,
   ];
