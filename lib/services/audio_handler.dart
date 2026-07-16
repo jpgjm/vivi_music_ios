@@ -33,6 +33,11 @@ class ViviAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   final List<Song> _songs = [];
   int _index = -1;
 
+  /// Monotonic token used to cancel out-of-order stream resolutions. When
+  /// the user rapidly taps different songs, only the most recent load
+  /// should actually start playback; older loads are silently discarded.
+  int _loadToken = 0;
+
   /// Broadcasts the current [Song] (null when idle).
   final BehaviorSubject<Song?> currentSong = BehaviorSubject.seeded(null);
 
@@ -80,14 +85,32 @@ class ViviAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   Future<void> _loadCurrent() async {
     if (_index < 0 || _index >= _songs.length) return;
     final song = _songs[_index];
+    final token = ++_loadToken;
+
+    // Broadcast the media item and queue IMMEDIATELY so the UI (mini
+    // player, notification, lock screen, etc.) can update without waiting
+    // for the stream URL to be resolved. This is what makes tapping a
+    // song feel responsive.
     currentSong.add(song);
+    mediaItem.add(song.toMediaItem());
+    queue.add(_songs.map((s) => s.toMediaItem()).toList());
+    // Also tell the OS we are loading so play/pause icons behave sensibly.
+    playbackState.add(playbackState.value.copyWith(
+      processingState: AudioProcessingState.loading,
+    ));
+
     try {
       final streamUrl = await _yt.getAudioStreamUrl(song.videoId);
+      // Skip if the user has already tapped another song since we started.
+      if (token != _loadToken) return;
+
       final item = song.toMediaItem(streamUrl: streamUrl);
       mediaItem.add(item);
-      queue.add(_songs.map((s) => s.toMediaItem()).toList());
       await _player.setUrl(streamUrl);
-    } catch (e) {
+    } catch (e, st) {
+      if (token != _loadToken) return;
+      // ignore: avoid_print
+      print('VIVI: failed to load ${song.videoId}: $e\n$st');
       // Skip forward on failure so playback isn't stuck.
       await _autoAdvance();
     }
