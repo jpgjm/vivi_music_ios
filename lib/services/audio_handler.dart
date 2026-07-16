@@ -1,435 +1,231 @@
+import 'dart:async';
+
 import 'package:audio_service/audio_service.dart';
-import 'package:cached_network_image/cached_network_image.dart';
-import 'package:flutter/material.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:rxdart/rxdart.dart';
 
 import '../models.dart';
-import '../services/audio_handler.dart';
-import '../services/download_service.dart';
-import '../services/lyrics_service.dart';
-import '../services/storage_service.dart';
-import '../widgets/lyrics_view.dart';
+import 'download_service.dart';
+import 'youtube_service.dart';
+import 'storage_service.dart';
 
-class PlayerPage extends StatefulWidget {
-  final ViviAudioHandler handler;
-  const PlayerPage({super.key, required this.handler});
-
-  @override
-  State<PlayerPage> createState() => _PlayerPageState();
+/// Sets up the background audio service. Call once at app startup.
+Future<ViviAudioHandler> initAudioService() async {
+  final handler = await AudioService.init(
+    builder: () => ViviAudioHandler(),
+    config: const AudioServiceConfig(
+      androidNotificationChannelId: 'com.vivi.music.channel.audio',
+      androidNotificationChannelName: 'VIVI Music playback',
+      androidNotificationOngoing: true,
+      androidStopForegroundOnPause: true,
+    ),
+  );
+  return handler;
 }
 
-class _PlayerPageState extends State<PlayerPage> {
-  final LyricsService _lyricsSvc = LyricsService();
+/// Central audio handler: owns a [_player] (just_audio), a queue of [Song]s
+/// and exposes standard media controls (play/pause/next/prev/seek). Resolves
+/// YouTube stream URLs lazily on demand; prefers a local file if the song
+/// has been downloaded.
+class ViviAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
+  final AudioPlayer _player = AudioPlayer();
+  final YoutubeService _yt = YoutubeService();
   final StorageService _storage = StorageService();
-  LyricResult _lyric = LyricResult.empty;
-  bool _showLyrics = false;
-  bool _favorite = false;
-  String? _lastLoadedVideoId;
 
-  @override
-  void initState() {
-    super.initState();
-    widget.handler.currentSong.listen(_onSongChanged);
-    final s = widget.handler.currentSong.valueOrNull;
-    if (s != null) _onSongChanged(s);
+  final List<Song> _songs = [];
+  int _index = -1;
+
+  /// Monotonic token used to cancel out-of-order stream resolutions. When
+  /// the user rapidly taps different songs, only the most recent load
+  /// should actually start playback; older loads are silently discarded.
+  int _loadToken = 0;
+
+  /// Broadcasts the current [Song] (null when idle).
+  final BehaviorSubject<Song?> currentSong = BehaviorSubject.seeded(null);
+
+  ViviAudioHandler() {
+    _player.playbackEventStream.listen(_broadcastState);
+    _player.processingStateStream.listen((state) async {
+      if (state == ProcessingState.completed) {
+        await _autoAdvance();
+      }
+    });
   }
 
-  Future<void> _onSongChanged(Song? song) async {
-    if (song == null) return;
-    if (song.videoId == _lastLoadedVideoId) return;
-    _lastLoadedVideoId = song.videoId;
-    final fav = await _storage.isFavorite(song.videoId);
-    if (mounted) setState(() => _favorite = fav);
+  Stream<Duration> get positionStream => _player.positionStream;
+  Stream<Duration?> get durationStream => _player.durationStream;
+  AudioPlayer get rawPlayer => _player;
+
+  // ---------- Queue management ----------
+
+  Future<void> playSong(Song song, {List<Song>? queue}) async {
+    _songs
+      ..clear()
+      ..addAll(queue ?? [song]);
+    _index = _songs.indexWhere((s) => s.videoId == song.videoId);
+    if (_index < 0) {
+      _songs.insert(0, song);
+      _index = 0;
+    }
+    await _loadCurrent();
+    await play();
+    await _storage.pushHistory(song);
+  }
+
+  Future<void> setQueueAndPlay(List<Song> queue, int startIndex) async {
+    _songs
+      ..clear()
+      ..addAll(queue);
+    _index = startIndex.clamp(0, _songs.length - 1);
+    await _loadCurrent();
+    await play();
+    if (_songs.isNotEmpty) {
+      await _storage.pushHistory(_songs[_index]);
+    }
+  }
+
+  Future<void> _loadCurrent() async {
+    if (_index < 0 || _index >= _songs.length) return;
+    final song = _songs[_index];
+    final token = ++_loadToken;
+
+    // Broadcast the media item and queue IMMEDIATELY so the UI (mini
+    // player, notification, lock screen, etc.) can update without waiting
+    // for the stream URL to be resolved. This is what makes tapping a
+    // song feel responsive.
+    currentSong.add(song);
+    mediaItem.add(song.toMediaItem());
+    queue.add(_songs.map((s) => s.toMediaItem()).toList());
+    // Also tell the OS we are loading so play/pause icons behave sensibly.
+    playbackState.add(playbackState.value.copyWith(
+      processingState: AudioProcessingState.loading,
+    ));
+
     try {
-      final result = await _lyricsSvc.fetch(
-        trackName: song.title,
-        artistName: song.artist,
-        duration: song.duration,
-      );
-      if (mounted && song.videoId == _lastLoadedVideoId) {
-        setState(() => _lyric = result);
+      // -------- OFFLINE PATH --------
+      // Prefer a locally-downloaded file if present. This is instant,
+      // works with no network, and bypasses YouTube entirely (also
+      // insulates us from YouTube-side breakage / throttling).
+      final localPath = await DownloadService.instance
+          .localPathIfDownloaded(song.videoId);
+      if (token != _loadToken) return;
+      if (localPath != null) {
+        final item = song.toMediaItem(streamUrl: 'file://$localPath');
+        mediaItem.add(item);
+        await _player.setFilePath(localPath);
+        return;
       }
-    } catch (_) {
-      if (mounted) setState(() => _lyric = LyricResult.empty);
+
+      // -------- ONLINE PATH --------
+      final streamUrl = await _yt.getAudioStreamUrl(song.videoId);
+      if (token != _loadToken) return;
+
+      final item = song.toMediaItem(streamUrl: streamUrl);
+      mediaItem.add(item);
+      await _player.setUrl(streamUrl);
+    } catch (e, st) {
+      if (token != _loadToken) return;
+      // ignore: avoid_print
+      print('VIVI: failed to load ${song.videoId}: $e\n$st');
+      // Skip forward on failure so playback isn't stuck.
+      await _autoAdvance();
+    }
+  }
+
+  Future<void> _autoAdvance() async {
+    if (_index + 1 < _songs.length) {
+      _index++;
+      await _loadCurrent();
+      await play();
+    } else {
+      await stop();
+    }
+  }
+
+  // ---------- Standard AudioHandler API ----------
+
+  @override
+  Future<void> play() => _player.play();
+
+  @override
+  Future<void> pause() => _player.pause();
+
+  @override
+  Future<void> seek(Duration position) => _player.seek(position);
+
+  @override
+  Future<void> stop() async {
+    await _player.stop();
+    currentSong.add(null);
+    await super.stop();
+  }
+
+  @override
+  Future<void> skipToNext() async {
+    if (_index + 1 < _songs.length) {
+      _index++;
+      await _loadCurrent();
+      await play();
     }
   }
 
   @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        leading: IconButton(
-          icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 32),
-          onPressed: () => Navigator.of(context).pop(),
-        ),
-        actions: [
-          IconButton(
-            icon: Icon(
-              _showLyrics
-                  ? Icons.album_rounded
-                  : Icons.lyrics_rounded,
-            ),
-            onPressed: () => setState(() => _showLyrics = !_showLyrics),
-          ),
-        ],
-      ),
-      body: StreamBuilder<MediaItem?>(
-        stream: widget.handler.mediaItem,
-        builder: (context, snap) {
-          final item = snap.data;
-          if (item == null) {
-            return const Center(child: Text('Nothing is playing'));
-          }
-          return Column(
-            children: [
-              Expanded(
-                child: AnimatedSwitcher(
-                  duration: const Duration(milliseconds: 300),
-                  child: _showLyrics
-                      ? LyricsView(
-                          key: const ValueKey('lyrics'),
-                          lyric: _lyric,
-                          positionStream: widget.handler.positionStream,
-                        )
-                      : _Artwork(
-                          key: const ValueKey('art'),
-                          artUri: item.artUri,
-                        ),
-                ),
-              ),
-              _MetaAndControls(
-                title: item.title,
-                artist: item.artist ?? '',
-                favorite: _favorite,
-                onFavorite: () async {
-                  final song = widget.handler.currentSong.valueOrNull;
-                  if (song == null) return;
-                  await _storage.toggleFavorite(song);
-                  final fav = await _storage.isFavorite(song.videoId);
-                  if (mounted) setState(() => _favorite = fav);
-                },
-                handler: widget.handler,
-              ),
-              const SizedBox(height: 24),
-            ],
-          );
-        },
-      ),
-    );
+  Future<void> skipToPrevious() async {
+    // If more than 5s in, restart current song; otherwise go to previous.
+    if (_player.position > const Duration(seconds: 5)) {
+      await _player.seek(Duration.zero);
+      return;
+    }
+    if (_index > 0) {
+      _index--;
+      await _loadCurrent();
+      await play();
+    } else {
+      await _player.seek(Duration.zero);
+    }
   }
-}
-
-class _Artwork extends StatelessWidget {
-  final Uri? artUri;
-  const _Artwork({super.key, required this.artUri});
 
   @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.all(32),
-      child: Center(
-        child: AspectRatio(
-          aspectRatio: 1,
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(28),
-            child: artUri != null
-                ? CachedNetworkImage(
-                    imageUrl: artUri.toString(),
-                    fit: BoxFit.cover,
-                    errorWidget: (_, __, ___) => Container(
-                      color: Theme.of(context)
-                          .colorScheme
-                          .surfaceContainerHighest,
-                      child: const Icon(Icons.music_note_rounded, size: 96),
-                    ),
-                  )
-                : Container(
-                    color: Theme.of(context)
-                        .colorScheme
-                        .surfaceContainerHighest,
-                    child: const Icon(Icons.music_note_rounded, size: 96),
-                  ),
-          ),
-        ),
-      ),
-    );
+  Future<void> skipToQueueItem(int i) async {
+    if (i < 0 || i >= _songs.length) return;
+    _index = i;
+    await _loadCurrent();
+    await play();
   }
-}
 
-class _MetaAndControls extends StatelessWidget {
-  final String title;
-  final String artist;
-  final bool favorite;
-  final VoidCallback onFavorite;
-  final ViviAudioHandler handler;
-
-  const _MetaAndControls({
-    required this.title,
-    required this.artist,
-    required this.favorite,
-    required this.onFavorite,
-    required this.handler,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 28),
-      child: Column(
-        children: [
-          Row(
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      title,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                          fontSize: 22, fontWeight: FontWeight.w700),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      artist,
-                      style: TextStyle(
-                        fontSize: 15,
-                        color: Theme.of(context)
-                            .colorScheme
-                            .onSurface
-                            .withOpacity(0.7),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              // Download button (reactive to DownloadService state)
-              _DownloadButton(handler: handler),
-              IconButton(
-                iconSize: 28,
-                icon: Icon(
-                  favorite ? Icons.favorite : Icons.favorite_border,
-                  color: favorite
-                      ? Theme.of(context).colorScheme.primary
-                      : null,
-                ),
-                onPressed: onFavorite,
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          _ProgressBar(handler: handler),
-          const SizedBox(height: 8),
-          StreamBuilder<PlaybackState>(
-            stream: handler.playbackState,
-            builder: (context, s) {
-              final playing = s.data?.playing ?? false;
-              return Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                children: [
-                  IconButton(
-                    iconSize: 42,
-                    icon: const Icon(Icons.skip_previous_rounded),
-                    onPressed: handler.skipToPrevious,
-                  ),
-                  Container(
-                    decoration: BoxDecoration(
-                      color: Theme.of(context).colorScheme.primary,
-                      shape: BoxShape.circle,
-                    ),
-                    child: IconButton(
-                      iconSize: 56,
-                      color: Theme.of(context).colorScheme.onPrimary,
-                      icon: Icon(playing
-                          ? Icons.pause_rounded
-                          : Icons.play_arrow_rounded),
-                      onPressed: () =>
-                          playing ? handler.pause() : handler.play(),
-                    ),
-                  ),
-                  IconButton(
-                    iconSize: 42,
-                    icon: const Icon(Icons.skip_next_rounded),
-                    onPressed: handler.skipToNext,
-                  ),
-                ],
-              );
-            },
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-/// Download / progress / delete button. Reactively reflects
-/// [DownloadService.progress] and [DownloadService.downloadedIds] for the
-/// currently playing song.
-class _DownloadButton extends StatelessWidget {
-  final ViviAudioHandler handler;
-  const _DownloadButton({required this.handler});
-
-  @override
-  Widget build(BuildContext context) {
-    final ds = DownloadService.instance;
-    return StreamBuilder<Song?>(
-      stream: handler.currentSong,
-      builder: (context, songSnap) {
-        final song = songSnap.data;
-        if (song == null) return const SizedBox.shrink();
-        return StreamBuilder<Map<String, double>>(
-          stream: ds.progress,
-          builder: (context, progressSnap) {
-            return StreamBuilder<Set<String>>(
-              stream: ds.downloadedIds,
-              builder: (context, downloadedSnap) {
-                final downloaded =
-                    downloadedSnap.data?.contains(song.videoId) ?? false;
-                final progress = progressSnap.data?[song.videoId];
-
-                if (downloaded) {
-                  // Downloaded — tap to delete (with confirm dialog).
-                  return IconButton(
-                    iconSize: 26,
-                    tooltip: 'Delete download',
-                    icon: Icon(
-                      Icons.cloud_done_rounded,
-                      color: Theme.of(context).colorScheme.primary,
-                    ),
-                    onPressed: () => _confirmDelete(context, song),
-                  );
-                }
-                if (progress != null && progress < 1.0) {
-                  // In progress — show progress ring, tap to cancel.
-                  return SizedBox(
-                    width: 44,
-                    height: 44,
-                    child: Stack(
-                      alignment: Alignment.center,
-                      children: [
-                        SizedBox(
-                          width: 26,
-                          height: 26,
-                          child: CircularProgressIndicator(
-                            value: progress,
-                            strokeWidth: 2.5,
-                          ),
-                        ),
-                        IconButton(
-                          iconSize: 16,
-                          padding: EdgeInsets.zero,
-                          tooltip: 'Cancel download',
-                          icon: const Icon(Icons.close_rounded),
-                          onPressed: () => ds.cancel(song.videoId),
-                        ),
-                      ],
-                    ),
-                  );
-                }
-                // Not downloaded — tap to download.
-                return IconButton(
-                  iconSize: 26,
-                  tooltip: 'Download for offline',
-                  icon: const Icon(Icons.cloud_download_outlined),
-                  onPressed: () => _startDownload(context, song),
-                );
-              },
-            );
-          },
-        );
+  void _broadcastState(PlaybackEvent event) {
+    final playing = _player.playing;
+    playbackState.add(playbackState.value.copyWith(
+      controls: [
+        MediaControl.skipToPrevious,
+        if (playing) MediaControl.pause else MediaControl.play,
+        MediaControl.stop,
+        MediaControl.skipToNext,
+      ],
+      systemActions: const {
+        MediaAction.seek,
+        MediaAction.seekForward,
+        MediaAction.seekBackward,
       },
-    );
+      androidCompactActionIndices: const [0, 1, 3],
+      processingState: const {
+        ProcessingState.idle: AudioProcessingState.idle,
+        ProcessingState.loading: AudioProcessingState.loading,
+        ProcessingState.buffering: AudioProcessingState.buffering,
+        ProcessingState.ready: AudioProcessingState.ready,
+        ProcessingState.completed: AudioProcessingState.completed,
+      }[_player.processingState]!,
+      playing: playing,
+      updatePosition: _player.position,
+      bufferedPosition: _player.bufferedPosition,
+      speed: _player.speed,
+      queueIndex: _index >= 0 ? _index : null,
+    ));
   }
 
-  Future<void> _startDownload(BuildContext context, Song song) async {
-    try {
-      await DownloadService.instance.download(song);
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Download complete')),
-        );
-      }
-    } catch (e) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Download failed: $e')),
-        );
-      }
-    }
-  }
-
-  Future<void> _confirmDelete(BuildContext context, Song song) async {
-    final yes = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Delete download?'),
-        content: Text('Remove "${song.title}" from downloads.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-    if (yes == true) {
-      await DownloadService.instance.deleteDownload(song.videoId);
-    }
-  }
-}
-
-class _ProgressBar extends StatelessWidget {
-  final ViviAudioHandler handler;
-  const _ProgressBar({required this.handler});
-
-  @override
-  Widget build(BuildContext context) {
-    return StreamBuilder<Duration>(
-      stream: handler.positionStream,
-      builder: (context, posSnap) {
-        final pos = posSnap.data ?? Duration.zero;
-        return StreamBuilder<Duration?>(
-          stream: handler.durationStream,
-          builder: (context, durSnap) {
-            final dur = durSnap.data ?? Duration.zero;
-            final max = dur.inMilliseconds > 0
-                ? dur.inMilliseconds.toDouble()
-                : 1.0;
-            final value = pos.inMilliseconds.clamp(0, max.toInt()).toDouble();
-            return Column(
-              children: [
-                Slider(
-                  min: 0,
-                  max: max,
-                  value: value,
-                  onChanged: (v) =>
-                      handler.seek(Duration(milliseconds: v.toInt())),
-                ),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 24),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(_fmt(pos)),
-                      Text(_fmt(dur)),
-                    ],
-                  ),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-  }
-
-  static String _fmt(Duration d) {
-    final m = d.inMinutes.remainder(60).toString();
-    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
-    return '$m:$s';
+  Future<void> dispose() async {
+    await _player.dispose();
+    await _yt.dispose();
+    await currentSong.close();
   }
 }
