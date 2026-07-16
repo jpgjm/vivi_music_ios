@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../models.dart';
 import '../services/audio_handler.dart';
+import '../services/download_service.dart';
 import '../services/lyrics_service.dart';
 import '../services/storage_service.dart';
 import '../widgets/lyrics_view.dart';
@@ -202,6 +203,8 @@ class _MetaAndControls extends StatelessWidget {
                   ],
                 ),
               ),
+              // Download button (reactive to DownloadService state)
+              _DownloadButton(handler: handler),
               IconButton(
                 iconSize: 28,
                 icon: Icon(
@@ -256,6 +259,126 @@ class _MetaAndControls extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+/// Download / progress / delete button. Reactively reflects
+/// [DownloadService.progress] and [DownloadService.downloadedIds] for the
+/// currently playing song.
+class _DownloadButton extends StatelessWidget {
+  final ViviAudioHandler handler;
+  const _DownloadButton({required this.handler});
+
+  @override
+  Widget build(BuildContext context) {
+    final ds = DownloadService.instance;
+    return StreamBuilder<Song?>(
+      stream: handler.currentSong,
+      builder: (context, songSnap) {
+        final song = songSnap.data;
+        if (song == null) return const SizedBox.shrink();
+        return StreamBuilder<Map<String, double>>(
+          stream: ds.progress,
+          builder: (context, progressSnap) {
+            return StreamBuilder<Set<String>>(
+              stream: ds.downloadedIds,
+              builder: (context, downloadedSnap) {
+                final downloaded =
+                    downloadedSnap.data?.contains(song.videoId) ?? false;
+                final progress = progressSnap.data?[song.videoId];
+
+                if (downloaded) {
+                  // Downloaded — tap to delete (with confirm dialog).
+                  return IconButton(
+                    iconSize: 26,
+                    tooltip: 'Delete download',
+                    icon: Icon(
+                      Icons.cloud_done_rounded,
+                      color: Theme.of(context).colorScheme.primary,
+                    ),
+                    onPressed: () => _confirmDelete(context, song),
+                  );
+                }
+                if (progress != null && progress < 1.0) {
+                  // In progress — show progress ring, tap to cancel.
+                  return SizedBox(
+                    width: 44,
+                    height: 44,
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        SizedBox(
+                          width: 26,
+                          height: 26,
+                          child: CircularProgressIndicator(
+                            value: progress,
+                            strokeWidth: 2.5,
+                          ),
+                        ),
+                        IconButton(
+                          iconSize: 16,
+                          padding: EdgeInsets.zero,
+                          tooltip: 'Cancel download',
+                          icon: const Icon(Icons.close_rounded),
+                          onPressed: () => ds.cancel(song.videoId),
+                        ),
+                      ],
+                    ),
+                  );
+                }
+                // Not downloaded — tap to download.
+                return IconButton(
+                  iconSize: 26,
+                  tooltip: 'Download for offline',
+                  icon: const Icon(Icons.cloud_download_outlined),
+                  onPressed: () => _startDownload(context, song),
+                );
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _startDownload(BuildContext context, Song song) async {
+    try {
+      await DownloadService.instance.download(song);
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Download complete')),
+        );
+      }
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Download failed: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _confirmDelete(BuildContext context, Song song) async {
+    final yes = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete download?'),
+        content: Text('Remove "${song.title}" from downloads.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (yes == true) {
+      await DownloadService.instance.deleteDownload(song.videoId);
+    }
   }
 }
 
