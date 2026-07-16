@@ -5,6 +5,7 @@ import 'package:just_audio/just_audio.dart';
 import 'package:rxdart/rxdart.dart';
 
 import '../models.dart';
+import 'download_service.dart';
 import 'youtube_service.dart';
 import 'storage_service.dart';
 
@@ -24,7 +25,8 @@ Future<ViviAudioHandler> initAudioService() async {
 
 /// Central audio handler: owns a [_player] (just_audio), a queue of [Song]s
 /// and exposes standard media controls (play/pause/next/prev/seek). Resolves
-/// YouTube stream URLs lazily on demand.
+/// YouTube stream URLs lazily on demand; prefers a local file if the song
+/// has been downloaded.
 class ViviAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
   final AudioPlayer _player = AudioPlayer();
   final YoutubeService _yt = YoutubeService();
@@ -100,8 +102,22 @@ class ViviAudioHandler extends BaseAudioHandler with QueueHandler, SeekHandler {
     ));
 
     try {
+      // -------- OFFLINE PATH --------
+      // Prefer a locally-downloaded file if present. This is instant,
+      // works with no network, and bypasses YouTube entirely (also
+      // insulates us from YouTube-side breakage / throttling).
+      final localPath = await DownloadService.instance
+          .localPathIfDownloaded(song.videoId);
+      if (token != _loadToken) return;
+      if (localPath != null) {
+        final item = song.toMediaItem(streamUrl: 'file://$localPath');
+        mediaItem.add(item);
+        await _player.setFilePath(localPath);
+        return;
+      }
+
+      // -------- ONLINE PATH --------
       final streamUrl = await _yt.getAudioStreamUrl(song.videoId);
-      // Skip if the user has already tapped another song since we started.
       if (token != _loadToken) return;
 
       final item = song.toMediaItem(streamUrl: streamUrl);
