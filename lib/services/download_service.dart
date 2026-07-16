@@ -20,7 +20,14 @@ class DownloadService {
 
   final YoutubeService _yt = YoutubeService();
   final StorageService _storage = StorageService();
-  final Dio _dio = Dio();
+  final Dio _dio = Dio(BaseOptions(
+    // Long timeouts because YouTube CDN can be slow to first-byte.
+    connectTimeout: const Duration(seconds: 30),
+    receiveTimeout: const Duration(minutes: 5),
+    // Follow redirects (googlevideo often redirects).
+    followRedirects: true,
+    maxRedirects: 5,
+  ));
 
   /// videoId → progress in 0.0..1.0. Absent = not being downloaded.
   final BehaviorSubject<Map<String, double>> progress =
@@ -81,34 +88,44 @@ class DownloadService {
 
     _updateProgress(song.videoId, 0.0);
 
+    Object? lastError;
     try {
-      final streamUrl = await _yt.getAudioStreamUrl(song.videoId);
-      final cancelToken = CancelToken();
-      _cancelTokens[song.videoId] = cancelToken;
-
-      await _dio.download(
-        streamUrl,
-        tmpPath,
-        cancelToken: cancelToken,
-        onReceiveProgress: (received, total) {
-          if (total > 0) {
-            _updateProgress(song.videoId, received / total);
+      // Try up to 2 times — YouTube URLs occasionally 403 / disconnect;
+      // re-resolving the URL fixes it in most cases.
+      for (var attempt = 0; attempt < 2; attempt++) {
+        try {
+          await _downloadOnce(song, tmpPath);
+          lastError = null;
+          break;
+        } catch (e) {
+          lastError = e;
+          // Clean up partial file before retrying.
+          final tmp = File(tmpPath);
+          if (tmp.existsSync()) {
+            try {
+              await tmp.delete();
+            } catch (_) {}
           }
-        },
-      );
+          if (attempt == 0) {
+            // Small back-off then retry with a freshly-resolved URL.
+            await Future.delayed(const Duration(milliseconds: 500));
+          }
+        }
+      }
 
-      // Only publish the file (and record it) once download is complete.
+      if (lastError != null) throw lastError;
+
+      // Publish the file and record it.
       await File(tmpPath).rename(finalPath);
       await _storage.addDownload(song);
       _addDownloadedId(song.videoId);
       _updateProgress(song.videoId, 1.0);
 
-      // Flash "done" briefly, then clear the progress marker.
       Future.delayed(const Duration(seconds: 1), () {
         _removeProgress(song.videoId);
       });
     } catch (e) {
-      // Best-effort cleanup of the partial file.
+      // Final cleanup.
       final tmp = File(tmpPath);
       if (tmp.existsSync()) {
         try {
@@ -119,6 +136,77 @@ class DownloadService {
       rethrow;
     } finally {
       _cancelTokens.remove(song.videoId);
+    }
+  }
+
+  /// One resolve+download cycle. Throws on failure.
+  Future<void> _downloadOnce(Song song, String tmpPath) async {
+    // Re-resolve the URL each attempt — YouTube URLs expire, and the
+    // safest way to recover from any prior 403 / disconnect is to fetch
+    // a fresh URL.
+    final info = await _yt.getAudioStreamInfo(song.videoId);
+
+    // -------------------------------------------------------------------
+    // CRITICAL: append `&range=0-<contentLength>` to the URL.
+    // Without this, YouTube's CDN drops the connection mid-transfer for
+    // non-browser clients. This is exactly what VIVI Music does on
+    // Android (`DownloadUtil.kt`).
+    // -------------------------------------------------------------------
+    final rangedUrl = '${info.url}&range=0-${info.contentLength}';
+
+    // Use a User-Agent that matches the InnerTube client which resolved
+    // the URL. YouTube's CDN sometimes throttles / disconnects clients
+    // whose UA does not match the `c=` in the URL.
+    final ua = _userAgentFor(info.clientName);
+
+    final cancelToken = CancelToken();
+    _cancelTokens[song.videoId] = cancelToken;
+
+    await _dio.download(
+      rangedUrl,
+      tmpPath,
+      cancelToken: cancelToken,
+      options: Options(
+        headers: {
+          'User-Agent': ua,
+          'Accept': '*/*',
+          'Accept-Encoding': 'identity',
+        },
+        // Don't throw on non-2xx so we can inspect the status ourselves.
+        validateStatus: (s) => s != null && s >= 200 && s < 300,
+      ),
+      onReceiveProgress: (received, total) {
+        // Use content length from the API if the server didn't send one
+        // (some CDN edges omit it when `range` is fully-specified).
+        final t = total > 0 ? total : info.contentLength;
+        if (t > 0) {
+          _updateProgress(song.videoId, (received / t).clamp(0.0, 1.0));
+        }
+      },
+    );
+  }
+
+  /// Pick a User-Agent that matches the client that resolved the URL.
+  /// Strings taken verbatim from the original VIVI Music InnerTube
+  /// client definitions.
+  static String _userAgentFor(String clientName) {
+    switch (clientName) {
+      case 'IOS':
+      case 'IOS_MUSIC':
+        return 'com.google.ios.youtube/21.03.1 '
+            '(iPhone16,2; U; CPU iOS 18_2 like Mac OS X;)';
+      case 'ANDROID_VR':
+        return 'com.google.android.apps.youtube.vr.oculus/1.61.48 '
+            '(Linux; U; Android 12; en_US; Oculus Quest 3; '
+            'Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)';
+      case 'ANDROID':
+      case 'ANDROID_MUSIC':
+        return 'com.google.android.youtube/21.03.38 '
+            '(Linux; U; Android 14) gzip';
+      default:
+        // Safe default: IOS UA.
+        return 'com.google.ios.youtube/21.03.1 '
+            '(iPhone16,2; U; CPU iOS 18_2 like Mac OS X;)';
     }
   }
 
