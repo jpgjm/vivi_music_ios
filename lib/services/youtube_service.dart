@@ -50,19 +50,39 @@ class YoutubeService {
 
   /// Resolve the best audio-only stream URL for a given [videoId].
   Future<String> getAudioStreamUrl(String videoId) async {
+    final info = await getAudioStreamInfo(videoId);
+    return info.url;
+  }
+
+  /// Resolve the best audio-only stream + its byte length. Used by the
+  /// download service which needs the length so it can append the required
+  /// `&range=0-<len>` query parameter to the URL.
+  ///
+  /// Also returns the InnerTube client name embedded in the resolved URL
+  /// (the `c=` query parameter, e.g. "IOS" or "ANDROID_VR"), so the caller
+  /// can send a matching User-Agent header — YouTube's CDN sometimes
+  /// throttles or disconnects clients whose UA does not match.
+  Future<AudioStreamInfo> getAudioStreamInfo(String videoId) async {
     final manifest = await _yt.videos.streamsClient.getManifest(
       videoId,
       ytClients: _streamClients,
     );
-    // Prefer highest-bitrate audio-only stream. Fall back to any audio.
+    // Prefer highest-bitrate audio-only stream. Fall back to muxed.
     final audioOnly = manifest.audioOnly.sortByBitrate();
     if (audioOnly.isNotEmpty) {
-      return audioOnly.last.url.toString();
+      final s = audioOnly.last;
+      return AudioStreamInfo(
+        url: s.url.toString(),
+        contentLength: s.size.totalBytes,
+      );
     }
-    // Fallback: muxed stream (rare on modern videos).
     final muxed = manifest.muxed.sortByBitrate();
     if (muxed.isNotEmpty) {
-      return muxed.last.url.toString();
+      final s = muxed.last;
+      return AudioStreamInfo(
+        url: s.url.toString(),
+        contentLength: s.size.totalBytes,
+      );
     }
     throw Exception('No playable stream found for $videoId');
   }
@@ -97,5 +117,22 @@ class YoutubeService {
     } catch (_) {
       return const [];
     }
+  }
+}
+
+/// Result of [YoutubeService.getAudioStreamInfo].
+class AudioStreamInfo {
+  final String url;
+  final int contentLength;
+  const AudioStreamInfo({
+    required this.url,
+    required this.contentLength,
+  });
+
+  /// The InnerTube client that resolved this URL, parsed from `c=` in the
+  /// query string. Empty if not present.
+  String get clientName {
+    final m = RegExp(r'[?&]c=([A-Z0-9_]+)').firstMatch(url);
+    return m?.group(1) ?? '';
   }
 }
