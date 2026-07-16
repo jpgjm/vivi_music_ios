@@ -4,6 +4,7 @@ import 'pages/home_page.dart';
 import 'pages/library_page.dart';
 import 'pages/search_page.dart';
 import 'services/audio_handler.dart';
+import 'services/download_service.dart';
 import 'theme.dart';
 import 'widgets/mini_player.dart';
 
@@ -11,6 +12,9 @@ late ViviAudioHandler audioHandler;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Load the persisted set of already-downloaded videoIds so the audio
+  // handler can prefer local files on startup.
+  await DownloadService.instance.init();
   audioHandler = await initAudioService();
   runApp(const ViviMusicApp());
 }
