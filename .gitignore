@@ -1,0 +1,16 @@
+# xcodegen が生成するもの
+*.xcodeproj
+*.xcworkspace
+
+# ビルド生成物
+build/
+DerivedData/
+dummy/
+Payload/
+
+# Xcode ユーザー設定
+xcuserdata/
+*.xcuserstate
+
+# macOS
+.DS_Store
