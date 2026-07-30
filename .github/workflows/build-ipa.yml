@@ -1,0 +1,124 @@
+# ViviMusic build-ipa.yml
+# rev: 1 (pure Swift / xcodegen — no Flutter, no CocoaPods)
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select newest Xcode available
+        run: |
+          echo "=== Available Xcodes ==="
+          ls -la /Applications | grep -i xcode || true
+          for X in $(ls /Applications | grep -E '^Xcode' | sort -V -r); do
+            APP="/Applications/$X/Contents/Developer"
+            if [ -d "$APP" ]; then
+              sudo xcode-select -s "$APP"
+              echo "Selected: $APP"
+              break
+            fi
+          done
+          xcodebuild -version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate
+          ls -la
+          test -d ViviMusic.xcodeproj && echo "OK" || (echo "xcodeproj not generated"; exit 1)
+
+      # continue-on-error は使わない。失敗したらここで止める。
+      # pipefail + tee でログは /tmp/xcodebuild.log に常時保存。
+      - name: Build (no codesign)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project ViviMusic.xcodeproj \
+            -scheme ViviMusic \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            2>&1 | tee /tmp/xcodebuild.log
+
+      - name: Show build log tail
+        if: always()
+        run: |
+          echo "=== Last 200 lines of xcodebuild log ==="
+          tail -200 /tmp/xcodebuild.log || true
+
+      # 成功時のログも見たいので常時アップロード。エラー原因の追跡に必須。
+      - name: Upload xcodebuild log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: /tmp/xcodebuild.log
+          if-no-files-found: warn
+
+      - name: Locate .app and verify binary
+        id: locate
+        run: |
+          echo "=== find results ==="
+          find build -name "ViviMusic.app" -type d
+          echo ""
+
+          APP=$(find build -name "ViviMusic.app" -type d | head -1)
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+            echo "::error::ViviMusic.app が見つかりません"
+            find build -maxdepth 6 -name "*.app" -type d || true
+            exit 1
+          fi
+
+          echo "=== Using: $APP ==="
+          ls -la "$APP"
+          echo "Total size: $(du -sh "$APP" | cut -f1)"
+
+          # コンパイル失敗時に空の .app が Copy Resource だけで作られるのを検知する。
+          if [ ! -f "$APP/ViviMusic" ]; then
+            echo "::error::ViviMusic 実行ファイルが .app 内に無い (コンパイル/リンク失敗)"
+            ls -la "$APP"
+            exit 1
+          fi
+
+          BIN_SIZE=$(stat -f %z "$APP/ViviMusic" 2>/dev/null || stat -c %s "$APP/ViviMusic")
+          echo "ViviMusic binary size: $BIN_SIZE bytes"
+          file "$APP/ViviMusic" || true
+
+          if [ "$BIN_SIZE" -lt 10000 ]; then
+            echo "::error::ViviMusic binary is essentially empty ($BIN_SIZE bytes)"
+            exit 1
+          fi
+
+          echo "app_path=$APP" >> "$GITHUB_OUTPUT"
+
+      - name: Package IPA
+        run: |
+          mkdir -p dummy Payload
+          cp -R "${{ steps.locate.outputs.app_path }}" Payload/
+          zip -r dummy/vivi_music.ipa Payload
+          rm -rf Payload
+          echo "=== IPA info ==="
+          ls -lh dummy/vivi_music.ipa
+          unzip -l dummy/vivi_music.ipa | tail -3
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: vivi-music-ipa
+          path: dummy/
