@@ -1,0 +1,149 @@
+# ViviMusic build-ipa.yml
+# rev: 4 (pure Swift / xcodegen — no Flutter, no CocoaPods)
+#
+# rev4 の変更点 (ArcBox rev2 / AlarmClock rev31 に合わせた):
+#   - Locate .app の find 探索 + steps.locate.outputs 経由を廃止。
+#     -derivedDataPath build で出力先は固定なので、
+#     旧 Verify .app の固定パス + 3 チェックに戻した。
+#   - Package IPA の dummy/ 中間ディレクトリを廃止。
+#     リポジトリ直下に vivi_music.ipa を作り path: で直接指定する。
+#     (成果物 ZIP の中身は従来と同一 — 直下に vivi_music.ipa)
+#
+# 成果物は 3 つ。すべて JST のビルド時刻を頭に付ける。
+#   <stamp>_vivi-music-ipa
+#   <stamp>_xcodebuild-log
+#   <stamp>_Repository      … 中身は ViviMusic/ で包む
+# 例: 2026-08-12T07-41-05+09-00_vivi-music-ipa.zip
+#
+# 時刻は最初のステップで 1 度だけ決め、3 つで同じ値を使う。
+# (ステップごとに date を呼ぶと数秒ずれて対応が取れなくなる)
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Set build timestamp (JST)
+        run: |
+          STAMP=$(TZ=Asia/Tokyo date +'%Y-%m-%dT%H-%M-%S+09-00')
+          echo "STAMP=$STAMP" >> "$GITHUB_ENV"
+          echo "Build stamp: $STAMP"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # xcodegen / xcodebuild を走らせる前に退避する。
+      # 後で取ると ViviMusic.xcodeproj や build/ が混ざる。
+      #
+      # ViviMusic/ で包むのは、展開先を間違えたときの事故を防ぐため。
+      # 包まないと ZIP の中身が展開したフォルダに直接ばら撒かれ、
+      # 既存の作業ディレクトリに重ねてしまう危険がある。
+      - name: Snapshot repository
+        run: |
+          mkdir -p /tmp/repo-snapshot/ViviMusic
+          rsync -a --exclude='.git' ./ /tmp/repo-snapshot/ViviMusic/
+          echo "=== snapshot ==="
+          find /tmp/repo-snapshot -type f | wc -l
+          du -sh /tmp/repo-snapshot
+          ls -a /tmp/repo-snapshot/ViviMusic
+
+      # ビルドが落ちても中身を確認できるよう always。
+      - name: Upload repository snapshot (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAMP }}_Repository
+          path: /tmp/repo-snapshot
+          # .github/ や .gitignore を落とさないために必須。
+          # v4.4 以降は既定で隠しファイルが除外される。
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Select newest Xcode available
+        run: |
+          echo "=== Available Xcodes ==="
+          ls -la /Applications | grep -i xcode || true
+          for X in $(ls /Applications | grep -E '^Xcode' | sort -V -r); do
+            APP="/Applications/$X/Contents/Developer"
+            if [ -d "$APP" ]; then
+              sudo xcode-select -s "$APP"
+              echo "Selected: $APP"
+              break
+            fi
+          done
+          xcodebuild -version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate
+          ls -la
+          test -d ViviMusic.xcodeproj && echo "OK" || (echo "xcodeproj not generated"; exit 1)
+
+      # continue-on-error は使わない。失敗したらここで止める。
+      # pipefail + tee でログは /tmp/xcodebuild.log に常時保存。
+      - name: Build (no codesign)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project ViviMusic.xcodeproj \
+            -scheme ViviMusic \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            2>&1 | tee /tmp/xcodebuild.log
+
+      - name: Show build log tail
+        if: always()
+        run: |
+          echo "=== Last 200 lines of xcodebuild log ==="
+          tail -200 /tmp/xcodebuild.log || true
+
+      # 成功時のログも見たいので常時アップロード。エラー原因の追跡に必須。
+      - name: Upload xcodebuild log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAMP }}_xcodebuild-log
+          path: /tmp/xcodebuild.log
+          if-no-files-found: warn
+
+      # -derivedDataPath build を指定しているので出力先は固定。
+      # find で探す必要はない。
+      - name: Verify .app
+        run: |
+          APP="build/Build/Products/Release-iphoneos/ViviMusic.app"
+          test -d "$APP" || { echo "::error::$APP が生成されていません"; exit 1; }
+          test -f "$APP/ViviMusic" || { echo "::error::実行バイナリがありません"; exit 1; }
+          test -f "$APP/Info.plist" || { echo "::error::Info.plist がありません"; exit 1; }
+          file "$APP/ViviMusic"
+          ls -la "$APP"
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/ViviMusic.app Payload/
+          zip -qry vivi_music.ipa Payload
+          rm -rf Payload
+          echo "=== IPA info ==="
+          ls -lh vivi_music.ipa
+          unzip -l vivi_music.ipa | tail -3
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.STAMP }}_vivi-music-ipa
+          path: vivi_music.ipa
